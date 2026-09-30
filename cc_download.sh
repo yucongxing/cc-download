@@ -1,6 +1,32 @@
 #!/bin/bash
 
 set -e
+set -o pipefail
+
+# 本地脚本优先接收管道输入；curl | bash 的 stdin 是代码，需要从终端读取答案。
+if [[ -n "${BASH_SOURCE[0]:-}" ]] && [ ! -t 0 ]; then
+    exec 3<&0
+elif { exec 3</dev/tty; } 2>/dev/null; then
+    :
+elif [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    exec 3<&0
+else
+    echo "没有可用的交互终端，请先保存脚本，再在终端运行 bash ./cc_download.sh。" >&2
+    exit 1
+fi
+
+read_choice() {
+    local prompt="$1" variable="$2"
+    if [ -t 3 ]; then
+        read -r -u 3 -p "$prompt" "$variable" || return 1
+    else
+        printf '%s' "$prompt" >&2
+        if ! read -r -u 3 "$variable"; then
+            echo "没有读取到输入。请在交互终端运行，或通过 stdin 提供菜单选项。" >&2
+            return 1
+        fi
+    fi
+}
 
 # ── 交互式模式选择 ────────────────────────────────────────────────────────────
 MODE=""
@@ -11,7 +37,7 @@ echo "  1) download  下载离线安装包（默认）"
 echo "  2) install   安装 Claude Code"
 echo "  3) update    更新 Claude Code"
 echo ""
-read -r -p "输入选项 [1/2/3]: " mode_choice < /dev/tty
+read_choice "输入选项 [1/2/3]: " mode_choice
 
 case "$mode_choice" in
     2) MODE="install" ;;
@@ -27,12 +53,12 @@ if [[ "$MODE" == "install" ]]; then
     echo "  3) stable"
     echo "  4) 指定版本号（如 1.0.33）"
     echo ""
-    read -r -p "输入选项 [1/2/3/4]: " target_choice < /dev/tty
+    read_choice "输入选项 [1/2/3/4]: " target_choice
     case "$target_choice" in
         2) TARGET="latest" ;;
         3) TARGET="stable" ;;
         4)
-            read -r -p "输入版本号（如 1.0.33）: " TARGET < /dev/tty
+            read_choice "输入版本号（如 1.0.33）: " TARGET
             if [[ ! "$TARGET" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[^[:space:]]+)?$ ]]; then
                 echo "版本号格式不正确（示例: 1.0.33）" >&2
                 exit 1
@@ -48,20 +74,26 @@ echo "请选择代理类型："
 echo "  1) HTTP 代理（默认）"
 echo "  2) 不使用代理"
 echo ""
-read -r -p "输入选项 [1/2]: " type_choice < /dev/tty
+read_choice "输入选项 [1/2]: " type_choice
 
 PROXY_URL=""
 CURL_PROXY_ARGS=()
+WGET_PROXY_ARGS=()
 
 if [[ "$type_choice" != "2" ]]; then
-    read -r -p "输入代理端口 [默认: 7897]: " port_input < /dev/tty
+    read_choice "输入代理端口 [默认: 7897]: " port_input
     port_input="${port_input:-7897}"
     PROXY_URL="http://127.0.0.1:$port_input"
-    CURL_PROXY_ARGS=(--proxy "$PROXY_URL")
+    CURL_PROXY_ARGS=(--proxy "$PROXY_URL" --noproxy "")
+    WGET_PROXY_ARGS=(-e use_proxy=yes -e "http_proxy=$PROXY_URL" -e "https_proxy=$PROXY_URL" -e no_proxy=)
+    unset no_proxy NO_PROXY
     export http_proxy="$PROXY_URL" https_proxy="$PROXY_URL"
     export HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL"
     echo "使用代理: $PROXY_URL"
 else
+    CURL_PROXY_ARGS=(--noproxy "*")
+    WGET_PROXY_ARGS=(-e use_proxy=no)
+    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
     echo "不使用代理，直接连接。"
 fi
 
@@ -78,23 +110,57 @@ fi
 HAS_JQ=false
 command -v jq >/dev/null 2>&1 && HAS_JQ=true
 
-# ── 下载函数（静默，输出到 stdout）───────────────────────────────────────────
-download_quiet() {
-    if [ "$DOWNLOADER" = "curl" ]; then
-        curl -fsSL "${CURL_PROXY_ARGS[@]}" "$1"
+# ── 下载文件：curl TLS 握手失败时使用 wget 重试 ──────────────────────────────
+download_file() {
+    local url="$1" output="$2" quiet="$3" status
+    local curl_args=(--fail --location --connect-timeout 15)
+    local wget_args=(--tries=1 --timeout=15)
+    if [ "$quiet" = true ]; then
+        curl_args+=(--silent --show-error --max-time 60)
+        wget_args+=(--no-verbose)
     else
-        wget -q -O - "$1"
+        curl_args+=(--show-error --progress-bar)
+        wget_args+=(--progress=bar:force)
     fi
+
+    if [ "$DOWNLOADER" = "curl" ]; then
+        if curl "${curl_args[@]}" "${CURL_PROXY_ARGS[@]}" -o "$output" "$url"; then
+            return 0
+        else
+            status=$?
+        fi
+        echo "curl 下载失败（退出码 $status）：$url" >&2
+        if [ "$status" -ne 35 ] || ! command -v wget >/dev/null 2>&1; then
+            return "$status"
+        fi
+        echo "TLS 握手失败，使用 wget 重试：$url" >&2
+    fi
+    # -O 覆盖 curl 可能留下的部分内容，避免拼接两个响应。
+    if wget "${wget_args[@]}" "${WGET_PROXY_ARGS[@]}" -O "$output" "$url"; then
+        return 0
+    else
+        status=$?
+        echo "wget 下载失败（退出码 $status）：$url；请检查 HTTP/混合代理端口及代理节点。" >&2
+        return "$status"
+    fi
+}
+
+# ── 下载文本：仅成功后输出完整内容，错误写入 stderr ──────────────────────────
+download_quiet() {
+    local temp_file status
+    temp_file=$(mktemp) || return 1
+    if download_file "$1" "$temp_file" true; then
+        if cat "$temp_file"; then status=0; else status=$?; fi
+    else
+        status=$?
+    fi
+    rm -f "$temp_file"
+    return "$status"
 }
 
 # ── 下载函数（带进度条，写入文件）────────────────────────────────────────────
 download_with_progress() {
-    local url="$1" output="$2"
-    if [ "$DOWNLOADER" = "curl" ]; then
-        curl -fL --progress-bar "${CURL_PROXY_ARGS[@]}" -o "$output" "$url"
-    else
-        wget --progress=bar:force -O "$output" "$url"
-    fi
+    download_file "$1" "$2" false
 }
 
 # ── SHA256 校验（依宿主 OS 选择工具）─────────────────────────────────────────
@@ -120,9 +186,11 @@ get_checksum_from_manifest() {
 fetch_checksum() {
     local manifest_json="$1" plat="$2" cs
     if [ "$HAS_JQ" = true ]; then
-        cs=$(echo "$manifest_json" | jq -r ".platforms[\"$plat\"].checksum // empty")
+        if ! cs=$(echo "$manifest_json" | jq -r ".platforms[\"$plat\"].checksum // empty"); then
+            echo "无法解析 manifest.json" >&2; return 1
+        fi
     else
-        cs=$(get_checksum_from_manifest "$manifest_json" "$plat")
+        cs=$(get_checksum_from_manifest "$manifest_json" "$plat") || cs=""
     fi
     if [ -z "$cs" ] || [[ ! "$cs" =~ ^[a-f0-9]{64}$ ]]; then
         echo "平台 $plat 未在 manifest 中找到" >&2; exit 1
@@ -194,21 +262,25 @@ detect_platform() {
 # ── 从官方 install.sh 动态解析下载基础 URL ───────────────────────────────────
 echo ""
 echo "获取最新安装脚本..."
-install_script=$(download_quiet "https://claude.ai/install.sh")
-
 GCS_BUCKET=""
-# 新版 bootstrap.sh 使用 DOWNLOAD_BASE_URL，旧版使用 GCS_BUCKET
-if [[ "$install_script" =~ DOWNLOAD_BASE_URL=\"([^\"]+)\" ]]; then
-    GCS_BUCKET="${BASH_REMATCH[1]}"
-elif [[ "$install_script" =~ GCS_BUCKET=\"([^\"]+)\" ]]; then
-    GCS_BUCKET="${BASH_REMATCH[1]}"
-fi
-
-if [[ -z "$GCS_BUCKET" ]]; then
-    echo "---- install.sh 内容预览 ----"
-    echo "${install_script:0:300}"
-    echo "-----------------------------"
-    echo "无法解析下载基础 URL（DOWNLOAD_BASE_URL / GCS_BUCKET），脚本格式可能已变更" >&2; exit 1
+if install_script=$(download_quiet "https://claude.ai/install.sh"); then
+    # 新版 bootstrap.sh 使用 DOWNLOAD_BASE_URL，旧版使用 GCS_BUCKET
+    if [[ "$install_script" =~ DOWNLOAD_BASE_URL=\"([^\"]+)\" ]]; then
+        GCS_BUCKET="${BASH_REMATCH[1]}"
+    elif [[ "$install_script" =~ GCS_BUCKET=\"([^\"]+)\" ]]; then
+        GCS_BUCKET="${BASH_REMATCH[1]}"
+    fi
+    if [[ -z "$GCS_BUCKET" ]]; then
+        echo "---- install.sh 内容预览 ----"
+        echo "${install_script:0:300}"
+        echo "-----------------------------"
+        echo "无法解析下载基础 URL（DOWNLOAD_BASE_URL / GCS_BUCKET），脚本格式可能已变更" >&2; exit 1
+    fi
+else
+    # 官方文档公布的发布仓库；安装入口可能返回 Cloudflare 403 验证页面。
+    # https://code.claude.com/docs/en/setup#verify-the-manifest-signature
+    GCS_BUCKET="https://downloads.claude.ai/claude-code-releases"
+    echo "获取 install.sh 失败，改用官方发布仓库：$GCS_BUCKET" >&2
 fi
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -227,7 +299,7 @@ if [[ -z "$MODE" ]]; then
     echo "  7) win32-x64          Windows x64"
     echo "  8) win32-arm64        Windows ARM64"
     echo ""
-    read -r -p "输入选项 [1-8]: " platform_choice < /dev/tty
+    read_choice "输入选项 [1-8]: " platform_choice
 
     IS_WIN=false
     case "$platform_choice" in
@@ -249,12 +321,12 @@ if [[ -z "$MODE" ]]; then
     echo "  2) stable（稳定版）"
     echo "  3) 输入指定版本号"
     echo ""
-    read -r -p "输入选项 [1/2/3]: " channel_choice < /dev/tty
+    read_choice "输入选项 [1/2/3]: " channel_choice
     channel=""
     case "$channel_choice" in
         2) channel="stable" ;;
         3)
-            read -r -p "输入版本号（如 1.0.33）: " channel < /dev/tty
+            read_choice "输入版本号（如 1.0.33）: " channel
             [[ ! "$channel" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] && \
                 { echo "版本号格式不正确" >&2; exit 1; }
             ;;

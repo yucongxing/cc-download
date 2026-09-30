@@ -141,6 +141,61 @@ npm install -g @anthropic-ai/claude-code --registry=https://registry.npmmirror.c
 ## FAQ
 
 <details>
+<summary><b>获取 install.sh / install.ps1 时返回 403？</b></summary>
+
+`claude.ai` 的安装入口可能返回 Cloudflare 验证页面或其他访问限制，403 本身不能证明地址已经迁移。官方安装文档仍使用该入口。
+
+安装脚本获取失败时，两套脚本会改用[官方文档公布的发布仓库](https://code.claude.com/docs/en/setup#verify-the-manifest-signature) `https://downloads.claude.ai/claude-code-releases`，继续查询版本、获取清单和下载二进制。SHA256 校验仍然执行。如果发布仓库也无法访问，脚本会停止并显示对应的网络错误。
+
+</details>
+
+<details>
+<summary><b>Bash 报 /dev/tty: No such device or address？</b></summary>
+
+这是运行环境没有交互终端，与目标网站无关。请在终端运行 `bash ./cc_download.sh`。本地脚本也支持从 stdin 提供选项，例如：
+
+```bash
+# download、不使用代理、Linux x64、latest
+printf '1\n2\n1\n1\n' | bash ./cc_download.sh
+```
+
+`curl ... | bash` 仍需要交互终端，因为 stdin 正在传输脚本内容。
+
+</details>
+
+<details>
+<summary><b>Linux / macOS 下载时遇到 curl 退出码 35？</b></summary>
+
+Bash 脚本会显示 curl 的 TLS 错误；如果机器已安装 wget，会通过同一代理使用 wget 重试。安装脚本、版本号、清单和二进制下载均支持此回退，二进制下载后仍会校验 SHA256。
+
+如果重试仍失败，请检查代理客户端的 HTTP / 混合端口及代理节点。选择“不使用代理”会禁用脚本下载请求的环境代理和工具默认代理。
+
+```bash
+# 将 17890 替换为你的 HTTP / 混合代理端口
+curl -v --proxy http://127.0.0.1:17890 --noproxy '' https://claude.ai/install.sh -o install.sh
+```
+
+</details>
+
+<details>
+<summary><b>Windows 获取 install.ps1 失败，curl 退出码 35？</b></summary>
+
+退出码 35 表示 SSL/TLS 握手失败，还没有进入下载地址解析阶段。新版 PowerShell 脚本会显示 curl 的具体错误，并通过 PowerShell 使用同一个代理重试安装脚本、版本号和版本清单请求。
+
+如果错误包含 `CRYPT_E_REVOCATION_OFFLINE (0x80092013)`，表示 Windows 无法访问证书吊销检查服务器。脚本会检测 Schannel curl 版本，7.70.0+ 自动为安装脚本、版本号、清单和二进制下载添加 `--ssl-revoke-best-effort`。该选项仅容忍吊销信息缺失或离线，服务器证书验证仍然执行；旧版 curl 会提示升级。如果安装入口随后返回 403，脚本会继续使用官方发布仓库。
+
+如果重试仍失败，请确认填写的是代理客户端的 **HTTP 或混合端口**，并切换代理节点后检查连接：
+
+```powershell
+# 将 17890 替换为你的 HTTP / 混合代理端口
+curl.exe -v --proxy http://127.0.0.1:17890 https://claude.ai/install.ps1 -o install.ps1
+```
+
+该命令只保存官方安装脚本，用于查看 TLS 错误。`-v` 会显示连接和握手详情。
+
+</details>
+
+<details>
 <summary><b>Windows 遇到执行策略限制怎么办？</b></summary>
 
 ```powershell

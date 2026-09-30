@@ -71,29 +71,105 @@ if ($typeChoice -ne "2") {
     Write-Host "不使用代理，直接连接。"
 }
 
+# ── Windows Schannel：容忍吊销检查服务器缺失或离线 ───────────────────────────
+$curlTlsOptions = @()
+$curlInfo = (curl.exe --version) -join "`n"
+$curlVersionMatch = [regex]::Match($curlInfo, '^curl\s+(\d+\.\d+\.\d+)')
+if ($curlInfo -match 'Schannel' -and $curlVersionMatch.Success) {
+    if ([version]$curlVersionMatch.Groups[1].Value -ge [version]'7.70.0') {
+        # 仍验证证书链、主机名及已知吊销状态，仅容忍无法获取吊销信息。
+        $curlTlsOptions = @("--ssl-revoke-best-effort")
+    } else {
+        Write-Warning "当前 Schannel curl 不支持 --ssl-revoke-best-effort。若出现 CRYPT_E_REVOCATION_OFFLINE，请升级 curl 至 7.70.0 或更高版本。"
+    }
+}
+
+# ── 获取文本：curl TLS 握手失败时使用 PowerShell 重试 ────────────────────────
+function Get-RemoteText {
+    param([string] $Url, [string] $Label)
+
+    $errorPath = [IO.Path]::GetTempFileName()
+    $savedErrorActionPreference = $ErrorActionPreference
+    # PowerShell 7 可配置为将原生命令的非零退出码转成终止错误。
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        # Windows PowerShell 5.1 会将原生命令 stderr 包装成错误记录。
+        $ErrorActionPreference = "Continue"
+        $lines = curl.exe --fail --silent --show-error --location `
+                          --connect-timeout 15 --max-time 60 @curlTlsOptions @curlProxy $Url 2> $errorPath
+        $curlExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+        $curlError = (Get-Content -LiteralPath $errorPath -Raw -ErrorAction SilentlyContinue)
+        Remove-Item -LiteralPath $errorPath -Force -ErrorAction SilentlyContinue
+    }
+
+    $text = $lines -join "`n"
+    if ($curlExitCode -eq 35) {
+        Write-Warning "curl 获取 $Label 时 TLS 握手失败（退出码 35）：$curlError"
+        Write-Host "使用 PowerShell 重试: $Url"
+        $requestParams = @{
+            Uri = $Url
+            UseBasicParsing = $true
+            TimeoutSec = 60
+            ErrorAction = "Stop"
+        }
+        if ($proxyUri) { $requestParams.Proxy = $proxyUri }
+
+        $savedSecurityProtocol = [Net.ServicePointManager]::SecurityProtocol
+        try {
+            # Windows PowerShell 5.1 的 .NET 默认协议可能不包含 TLS 1.2。
+            [Net.ServicePointManager]::SecurityProtocol = $savedSecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            $response = Invoke-WebRequest @requestParams
+            $text = if ($response.Content -is [byte[]]) {
+                [Text.Encoding]::UTF8.GetString($response.Content)
+            } else {
+                [string]$response.Content
+            }
+        } catch {
+            throw "获取 $Label 失败：curl TLS 握手失败（退出码 35）：$curlError；PowerShell 重试失败：$($_.Exception.Message)。请确认代理端口是 HTTP/混合端口，并检查代理节点能否访问 $Url。"
+        } finally {
+            [Net.ServicePointManager]::SecurityProtocol = $savedSecurityProtocol
+        }
+    } elseif ($curlExitCode -ne 0) {
+        throw "获取 $Label 失败（curl 退出码 $curlExitCode）：$curlError"
+    }
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw "获取 $Label 失败：$Url 返回了空内容。"
+    }
+    return $text
+}
+
 # ── 从官方 install.ps1 动态解析下载基础 URL ───────────────────────────────────
 Write-Host ""
 Write-Host "获取最新安装脚本..."
-$installScript = curl.exe -s -L @curlProxy "https://claude.ai/install.ps1"
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "获取 install.ps1 失败（退出码 $LASTEXITCODE）"
-    exit 1
+try {
+    $installScript = Get-RemoteText -Url "https://claude.ai/install.ps1" -Label "install.ps1"
+} catch {
+    Write-Warning $_.Exception.Message
+    $installScript = ""
 }
 
-# 新版 bootstrap.ps1 使用 $DOWNLOAD_BASE_URL，旧版使用 $GCS_BUCKET
-$bucketMatch = [regex]::Match($installScript, '\$DOWNLOAD_BASE_URL\s*=\s*"([^"]+)"')
-if (-not $bucketMatch.Success) {
-    $bucketMatch = [regex]::Match($installScript, '\$GCS_BUCKET\s*=\s*"([^"]+)"')
+if ($installScript) {
+    # 新版 bootstrap.ps1 使用 $DOWNLOAD_BASE_URL，旧版使用 $GCS_BUCKET
+    $bucketMatch = [regex]::Match($installScript, '\$DOWNLOAD_BASE_URL\s*=\s*"([^"]+)"')
+    if (-not $bucketMatch.Success) {
+        $bucketMatch = [regex]::Match($installScript, '\$GCS_BUCKET\s*=\s*"([^"]+)"')
+    }
+    if (-not $bucketMatch.Success) {
+        $preview = if ($installScript.Length -gt 300) { $installScript.Substring(0, 300) } else { $installScript }
+        Write-Host "---- install.ps1 返回内容预览 ----"
+        Write-Host $preview
+        Write-Host "----------------------------------"
+        Write-Error "无法从 install.ps1 解析下载基础 URL（DOWNLOAD_BASE_URL / GCS_BUCKET），脚本格式可能已变更"
+        exit 1
+    }
+    $GCS_BUCKET = $bucketMatch.Groups[1].Value
+} else {
+    # https://code.claude.com/docs/en/setup#verify-the-manifest-signature
+    $GCS_BUCKET = "https://downloads.claude.ai/claude-code-releases"
+    Write-Host "获取 install.ps1 失败，改用官方发布仓库：$GCS_BUCKET"
 }
-if (-not $bucketMatch.Success) {
-    $preview = if ($installScript.Length -gt 300) { $installScript.Substring(0, 300) } else { $installScript }
-    Write-Host "---- install.ps1 返回内容预览 ----"
-    Write-Host $preview
-    Write-Host "----------------------------------"
-    Write-Error "无法从 install.ps1 解析下载基础 URL（DOWNLOAD_BASE_URL / GCS_BUCKET），脚本格式可能已变更"
-    exit 1
-}
-$GCS_BUCKET = $bucketMatch.Groups[1].Value
 
 # ── 下载或复用已缓存的 claude 二进制 ──────────────────────────────────────────
 function Get-ClaudeBinary {
@@ -116,10 +192,18 @@ function Get-ClaudeBinary {
     }
     Write-Host "下载 $Label..."
     Write-Host "下载地址: $DownloadUrl"
-    curl.exe @Proxy --progress-bar -L -o $BinaryPath $DownloadUrl
-    if ($LASTEXITCODE -ne 0) {
+    $savedErrorActionPreference = $ErrorActionPreference
+    $PSNativeCommandUseErrorActionPreference = $false
+    try {
+        $ErrorActionPreference = "Continue"
+        curl.exe @curlTlsOptions @Proxy --fail --show-error --progress-bar -L -o $BinaryPath $DownloadUrl
+        $curlExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorActionPreference
+    }
+    if ($curlExitCode -ne 0) {
         if (Test-Path $BinaryPath) { Remove-Item -Force $BinaryPath }
-        Write-Error "下载失败"; exit 1
+        Write-Error "下载失败（curl 退出码 $curlExitCode）：$DownloadUrl"; exit 1
     }
     Write-Host ""
     Write-Host "校验文件完整性..."
@@ -182,18 +266,14 @@ if ($Mode -eq "") {
     if ($channel -match '^\d+\.\d+\.\d+') {
         $version = $channel
     } else {
-        $version = (curl.exe -s @curlProxy "$GCS_BUCKET/$channel").Trim()
-        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($version)) {
-            Write-Error "获取 $channel 版本号失败"; exit 1
-        }
+        $version = (Get-RemoteText -Url "$GCS_BUCKET/$channel" -Label "$channel 版本号").Trim()
     }
     Write-Host "版本: $version"
 
     # ── 获取 manifest & checksum ──────────────────────────────────────────────
     Write-Host ""
     Write-Host "获取版本清单..."
-    $manifestJson = curl.exe -s @curlProxy "$GCS_BUCKET/$version/manifest.json"
-    if ($LASTEXITCODE -ne 0) { Write-Error "获取 manifest.json 失败"; exit 1 }
+    $manifestJson = Get-RemoteText -Url "$GCS_BUCKET/$version/manifest.json" -Label "manifest.json"
     $manifest = $manifestJson | ConvertFrom-Json
     $checksum = $manifest.platforms.($selPlatform.Name).checksum
     if (-not $checksum) { Write-Error "平台 $($selPlatform.Name) 未在 manifest 中找到"; exit 1 }
@@ -268,10 +348,7 @@ if ($Mode -eq "") {
     Write-Host "当前版本: $(if ($currentVersion) { $currentVersion } else { '未知' })"
 
     # ── 获取最新版本号 ─────────────────────────────────────────────────────────
-    $latestVersion = (curl.exe -s @curlProxy "$GCS_BUCKET/latest").Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($latestVersion)) {
-        Write-Error "获取最新版本号失败"; exit 1
-    }
+    $latestVersion = (Get-RemoteText -Url "$GCS_BUCKET/latest" -Label "最新版本号").Trim()
     Write-Host "最新版本: $latestVersion"
 
     if ($currentVersion -eq $latestVersion) {
@@ -290,8 +367,7 @@ if ($Mode -eq "") {
     # ── 获取 manifest & checksum ──────────────────────────────────────────────
     Write-Host ""
     Write-Host "获取版本清单..."
-    $manifestJson = curl.exe -s @curlProxy "$GCS_BUCKET/$latestVersion/manifest.json"
-    if ($LASTEXITCODE -ne 0) { Write-Error "获取 manifest.json 失败"; exit 1 }
+    $manifestJson = Get-RemoteText -Url "$GCS_BUCKET/$latestVersion/manifest.json" -Label "manifest.json"
     $manifest = $manifestJson | ConvertFrom-Json
     $checksum = $manifest.platforms.$platform.checksum
     if (-not $checksum) { Write-Error "平台 $platform 未在 manifest 中找到"; exit 1 }
@@ -347,10 +423,7 @@ if ($Mode -eq "") {
     Write-Host "下载目录: $dlDir"
 
     # ── 获取最新版本号 ─────────────────────────────────────────────────────────
-    $latestVersion = (curl.exe -s @curlProxy "$GCS_BUCKET/latest").Trim()
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($latestVersion)) {
-        Write-Error "获取最新版本号失败"; exit 1
-    }
+    $latestVersion = (Get-RemoteText -Url "$GCS_BUCKET/latest" -Label "最新版本号").Trim()
     Write-Host "最新版本: $latestVersion"
 
     # ── 检查是否已安装 ─────────────────────────────────────────────────────────
@@ -395,8 +468,7 @@ if ($Mode -eq "") {
     # ── 获取 manifest & checksum ──────────────────────────────────────────────
     Write-Host ""
     Write-Host "获取版本清单..."
-    $manifestJson = curl.exe -s @curlProxy "$GCS_BUCKET/$latestVersion/manifest.json"
-    if ($LASTEXITCODE -ne 0) { Write-Error "获取 manifest.json 失败"; exit 1 }
+    $manifestJson = Get-RemoteText -Url "$GCS_BUCKET/$latestVersion/manifest.json" -Label "manifest.json"
     $manifest = $manifestJson | ConvertFrom-Json
     $checksum = $manifest.platforms.$platform.checksum
     if (-not $checksum) { Write-Error "平台 $platform 未在 manifest 中找到"; exit 1 }
